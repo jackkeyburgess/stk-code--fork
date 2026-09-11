@@ -43,20 +43,24 @@ jobs:
           submodules: recursive
           fetch-depth: 1
 
-      # 2. The game assets (karts, tracks, textures). generate_assets.sh looks
-      #    for them at ../../stk-assets, i.e. a sibling folder of the checkout.
-      - name: Checkout stk-assets (siblings dir)
-        uses: actions/checkout@v4
-        with:
-          repository: supertuxkart/stk-assets
-          path: stk-assets-src
-          fetch-depth: 1
-
-      - name: Place stk-assets as a sibling of stk-code
+      # 2. The game assets (karts, tracks, textures). These are NOT on GitHub —
+      #    STK distributes them over SVN (see stk-code/INSTALL.md). They must sit
+      #    in a folder named "stk-assets" that is a SIBLING of the stk-code
+      #    checkout, because generate_assets.sh looks for ../stk-assets.
+      #    The checkout lives at .../work/stk-code--fork/stk-code--fork, so the
+      #    sibling is one level up from github.workspace.
+      - name: Install Subversion
         run: |
-          mkdir -p "${{ github.workspace }}/../stk-assets"
-          cp -a stk-assets-src/. "${{ github.workspace }}/../stk-assets/"
-          rm -rf stk-assets-src
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends subversion
+
+      - name: Checkout stk-assets from SVN (sibling of stk-code)
+        run: |
+          cd "${{ github.workspace }}/.."
+          svn co --non-interactive --trust-server-cert \
+            https://svn.code.sf.net/p/supertuxkart/code/stk-assets stk-assets
+          echo "stk-assets checked out to: $(pwd)/stk-assets"
+          du -sh stk-assets || true
 
       # 3. Native build toolchain + asset-optimization tools (see android/ANDROID.md).
       - name: Install build dependencies
