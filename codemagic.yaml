@@ -1,0 +1,105 @@
+# Codemagic CI/CD pipeline for building a SuperTuxKart Android .apk
+# Place this file at the ROOT of your stk-code fork: codemagic.yaml
+#
+# In the Codemagic UI: connect the repo, then pick the "android-apk" workflow
+# and press "Start new build". The finished .apk shows up under the build's
+# "Artifacts" section for download.
+
+workflows:
+  android-apk:
+    name: SuperTuxKart Android APK
+    # Linux machine with the Android SDK + build tools preinstalled.
+    instance_type: linux_x2
+    max_build_duration: 120
+
+    environment:
+      java: 17
+      vars:
+        STK_NDK_VERSION: "28.1.13356709"
+        STK_TARGET_ANDROID_SDK: "35"
+        # "preview" tracks git/1.5 dependencies; change if you build a tagged release.
+        DEPS_TAG: "preview"
+        # Change to armv7 / x86 / x86_64 / all if you need a different target.
+        COMPILE_ARCH: "aarch64"
+        BUILD_TYPE: "debug"
+        PROJECT_VERSION: "git"
+        PROJECT_CODE: "1"
+
+    scripts:
+      # 1. Engine submodules (Codemagic already cloned the repo itself).
+      - name: Fetch git submodules
+        script: |
+          git submodule update --init --recursive --depth 1
+
+      # 2. Asset-optimization + native build tools (Codemagic Linux is Ubuntu-based).
+      - name: Install build dependencies
+        script: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            subversion \
+            autoconf automake make cmake meson ninja-build \
+            flex bison pkg-config gettext \
+            python3 python3-mako python3-packaging \
+            imagemagick pngquant advancecomp libjpeg-progs optipng vorbis-tools \
+            unzip xz-utils curl
+
+      # 3. Game assets. NOT on GitHub — pulled over SVN and placed as a SIBLING
+      #    of the repo checkout, because generate_assets.sh looks for ../stk-assets.
+      - name: Checkout stk-assets (SVN, sibling dir)
+        script: |
+          cd "$CM_BUILD_DIR/.."
+          svn co --non-interactive --trust-server-cert \
+            https://svn.code.sf.net/p/supertuxkart/code/stk-assets stk-assets
+          echo "stk-assets at: $(pwd)/stk-assets"
+          du -sh stk-assets || true
+
+      # 4. Exact NDK version STK's scripts expect.
+      - name: Install NDK + build-tools
+        script: |
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager "ndk;${STK_NDK_VERSION}" \
+                     "platforms;android-${STK_TARGET_ANDROID_SDK}" \
+                     "build-tools;35.0.0"
+
+      # 5. Prebuilt dependency sources (curl, freetype, openal, ...) not in-tree.
+      - name: Download & extract Android dependency sources
+        script: |
+          cd lib
+          curl -fL -o deps.tar.xz \
+            "https://github.com/supertuxkart/dependencies/releases/download/${DEPS_TAG}/dependencies-android-src.tar.xz"
+          tar xf deps.tar.xz
+          rm deps.tar.xz
+          ls -la
+
+      # 6. Build scripts locate the SDK/NDK through these symlinks.
+      - name: Link SDK & NDK into the android project
+        script: |
+          cd android
+          ln -sfn "$ANDROID_SDK_ROOT"      android-sdk
+          ln -sfn "$ANDROID_SDK_ROOT/ndk"  android-ndk
+
+      # 7. Prevent the Gradle OOM documented in ANDROID.md troubleshooting.
+      - name: Raise Gradle heap
+        script: |
+          echo "org.gradle.jvmargs=-XX:MaxHeapSize=4096m -Xmx4096m" >> android/gradle.properties
+
+      # 8. Assets -> native deps -> APK (the long native-compile step).
+      - name: Generate assets
+        script: |
+          cd android
+          ./generate_assets.sh
+
+      - name: Build native dependencies
+        script: |
+          cd android
+          ./make_deps.sh
+
+      - name: Build APK
+        script: |
+          cd android
+          ./make.sh -j$(nproc)
+
+    # 9. Everything matching these globs is offered for download after the build.
+    artifacts:
+      - android/bin/*.apk
+      - android/build/outputs/**/*.apk
