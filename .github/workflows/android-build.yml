@@ -1,0 +1,145 @@
+name: Build SuperTuxKart Android APK
+
+# Builds an Android .apk for SuperTuxKart entirely on GitHub's runners.
+# Drop this file into a fork of https://github.com/supertuxkart/stk-code
+# at: .github/workflows/android-build.yml
+#
+# Run it from the repo's "Actions" tab (Run workflow), or on every push to master.
+# The finished .apk is uploaded as a downloadable build artifact.
+
+on:
+  workflow_dispatch:
+    inputs:
+      arch:
+        description: "CPU architecture (all, armv7, aarch64, x86, x86_64)"
+        default: "aarch64"
+        type: choice
+        options: [all, armv7, aarch64, x86, x86_64]
+      build_type:
+        description: "Build type"
+        default: "debug"
+        type: choice
+        options: [debug, release]
+  push:
+    branches: [master]
+
+env:
+  STK_NDK_VERSION: "28.1.13356709"
+  STK_TARGET_ANDROID_SDK: "35"
+  STK_MIN_ANDROID_SDK: "21"
+  # "preview" tracks git/1.5; pick the tag matching the STK version you build.
+  DEPS_TAG: "preview"
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+
+    steps:
+      # 1. The engine source (lib/ subfolders are needed, so pull submodules).
+      - name: Checkout stk-code
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 1
+
+      # 2. The game assets (karts, tracks, textures). generate_assets.sh looks
+      #    for them at ../../stk-assets, i.e. a sibling folder of the checkout.
+      - name: Checkout stk-assets (siblings dir)
+        uses: actions/checkout@v4
+        with:
+          repository: supertuxkart/stk-assets
+          path: stk-assets-src
+          fetch-depth: 1
+
+      - name: Place stk-assets as a sibling of stk-code
+        run: |
+          mkdir -p "${{ github.workspace }}/../stk-assets"
+          cp -a stk-assets-src/. "${{ github.workspace }}/../stk-assets/"
+          rm -rf stk-assets-src
+
+      # 3. Native build toolchain + asset-optimization tools (see android/ANDROID.md).
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            autoconf automake make cmake meson ninja-build \
+            flex bison pkg-config gettext \
+            python3 python3-mako python3-packaging \
+            imagemagick pngquant advancecomp libjpeg-progs optipng vorbis-tools \
+            unzip xz-utils curl
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      # 4. Android SDK + the exact NDK version STK's scripts expect.
+      - name: Set up Android SDK / NDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install NDK + build-tools
+        run: |
+          sdkmanager "ndk;${STK_NDK_VERSION}" \
+                     "platforms;android-${STK_TARGET_ANDROID_SDK}" \
+                     "build-tools;35.0.0"
+
+      # 5. Prebuilt dependency sources (curl, freetype, openal, ...) not in-tree.
+      - name: Download & extract Android dependency sources
+        run: |
+          cd lib
+          curl -fL -o deps.tar.xz \
+            "https://github.com/supertuxkart/dependencies/releases/download/${DEPS_TAG}/dependencies-android-src.tar.xz"
+          tar xf deps.tar.xz
+          rm deps.tar.xz
+          ls -la
+
+      # 6. The build scripts locate the SDK/NDK through these symlinks.
+      - name: Link SDK & NDK into the android project
+        run: |
+          cd android
+          ln -sfn "$ANDROID_HOME"      android-sdk
+          ln -sfn "$ANDROID_HOME/ndk"  android-ndk
+
+      # 7. Prevent the Gradle OOM documented in ANDROID.md troubleshooting.
+      - name: Raise Gradle heap
+        run: |
+          echo "org.gradle.jvmargs=-XX:MaxHeapSize=4096m -Xmx4096m" >> android/gradle.properties
+
+      # 8. Assets -> native deps -> APK.  This is the long step (native compile).
+      - name: Generate assets
+        working-directory: android
+        run: ./generate_assets.sh
+
+      - name: Build native dependencies
+        working-directory: android
+        env:
+          COMPILE_ARCH: ${{ github.event.inputs.arch || 'aarch64' }}
+        run: ./make_deps.sh
+
+      - name: Build APK
+        working-directory: android
+        env:
+          COMPILE_ARCH: ${{ github.event.inputs.arch || 'aarch64' }}
+          BUILD_TYPE: ${{ github.event.inputs.build_type || 'debug' }}
+          PROJECT_VERSION: "git"
+          PROJECT_CODE: "1"
+        run: ./make.sh -j$(nproc)
+
+      - name: Locate built APK(s)
+        id: find_apk
+        run: |
+          echo "Searching for generated .apk files..."
+          find . -name "*.apk" -not -path "*/android-sdk/*" -not -path "*/android-ndk/*" | tee apk_list.txt
+
+      # 9. The result you download from the workflow run's summary page.
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: supertuxkart-${{ github.event.inputs.arch || 'aarch64' }}-${{ github.event.inputs.build_type || 'debug' }}-apk
+          path: |
+            android/bin/*.apk
+            android/build/outputs/**/*.apk
+          if-no-files-found: error
+          retention-days: 14
